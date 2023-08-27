@@ -259,10 +259,10 @@ def cnn_from_cfg_general(
 
     :param cfg: Configuration (basically a dictionary)
         configuration chosen by smac
-    :param seed: int or RandomState
-        used to initialize the rf's random generator
     :param fidelity: str
         determines which fidelity should be edited with min and max budget values
+    :param seed: int or RandomState
+        used to initialize the rf's random generator
     :param budget: float
         used to set max iterations for the MLP
     Returns
@@ -373,6 +373,8 @@ def cnn_from_cfg_mf(
         configuration chosen by smac
     :param seed: int or RandomState
         used to initialize the rf's random generator
+    :param fidelity: str
+        determines which fidelity should be edited with min and max budget values
     :param budget: float
         used to set max iterations for the MLP
     Returns
@@ -468,7 +470,16 @@ def cnn_from_cfg_mf(
     results = val_error
     return results
 
-def optimize_smac_hyperparameters(trial):
+def optimize_smac_hyperparameters(trial) -> dict:
+    """
+    Yields parameter config for the internal random forrest model used by SMAC
+
+    :param trial: trial of a smac hyperparameter optimization
+
+    Returns
+    -------
+    dict with parameters for RF model
+    """
 
 
     # Optimize parameters of the random forest model
@@ -486,7 +497,15 @@ def optimize_smac_hyperparameters(trial):
 
 
 def plot_main_trajectory(facades: list[AbstractFacade], plot_name: str = 'epoch') -> None:
-    """Plots the trajectory (incumbents) of the optimization process."""
+    """Plots the trajectory (incumbents) of the optimization process.
+    :facades list: list of facades (smac runs)
+    :plot_name str: name of the plot
+
+    Returns
+    -------
+    None
+    """
+
     plt.figure()
     plt.title("Trajectory")
     plt.xlabel("Wallclock time [s]")
@@ -512,7 +531,16 @@ def plot_main_trajectory(facades: list[AbstractFacade], plot_name: str = 'epoch'
     plt.savefig(f"visualizations/trajectory_{plot_name}.png")
 
 
-def plot_optuna_trajectories(dictionary):
+def plot_optuna_trajectories(dictionary: dict) -> None:
+    """
+    Plots the trajectory (incumbents) of the optuna optimization process.
+    :dictionary dict: dictionary with information for the plots
+
+    Returns
+    -------
+    None
+    """
+
     plt.figure()
     plt.title("Trajectories")
     plt.xlabel("Wallclock time [s]")
@@ -543,6 +571,15 @@ def plot_optuna_trajectories(dictionary):
 
 
 def plot_seeds_trajectory(results_per_seed: dict) -> None:
+    """
+    Plots the trajectory (incumbents) of the multi-fidelity selection for every seed and fidelity.
+    :results_per_seed dict: includes the facade for each seed and budget combination.
+
+    Returns
+    -------
+    None
+    """
+
     plt.figure()
     plt.title("Trajectory")
     plt.xlabel("Wallclock time [s]")
@@ -571,6 +608,14 @@ def plot_seeds_trajectory(results_per_seed: dict) -> None:
 
 
 def train_mf_selection(cs: ConfigurationSpace) -> str:
+    """
+    With a reduced budget, run a less expensive run for the fidelities with different seeds
+    :cs ConfigurationSpace: this is a reduced configspace for the smac initialization
+
+    Returns
+    -------
+    best_fidelity the best fidelity according to the metric chosen in the script arguments
+    """
     results_per_seed = {}
     fidelity_budgets = {'img_size': (8, 16), 'epochs': (5, 10)}  # use reduced budgets to decrease processing time
 
@@ -613,6 +658,16 @@ def train_mf_selection(cs: ConfigurationSpace) -> str:
 
 
 def get_best_fidelity(results_per_seed: dict) -> str:
+    """
+    This aims to calculate the best fidelity based on optimization runs of smac for each fidelity and seed
+    This metric takes both the cost and the walltime spent into account
+
+    :results_per_seed dict: includes the facade for each seed and budget combination.
+
+    Returns
+    -------
+    best_fidelity the best fidelity according to the metric chosen in the script arguments
+    """
     seperate_run_scores = {}
     for (seed, budget_type), facade in results_per_seed.items():
         X, Y = [], []
@@ -651,6 +706,19 @@ def get_best_fidelity(results_per_seed: dict) -> str:
 
 
 def calc_spearman_correlation(confs: list[Configuration], seed: int, fidelity_budgets: dict) -> float:
+    """
+    Calculates the spearman rank correlation based on a fixed set of configs for different fidelites.
+
+    :confs list[Configuration]: a fixed set of configs that will be evaluated on cheap and exp budget
+    :seed int: the seed
+    :fidelity_budgets dict: a dict containing the different fidelities like epochs and their corresponding (min, max)
+
+    Returns
+    -------
+    sp_correlations dict of the fidelities and their rank correlation
+    """
+
+
     sp_correlations = dict()
 
     for fidelity, budgets in fidelity_budgets.items():
@@ -668,16 +736,13 @@ def final_training(
         seed: int
 ) -> float:
     """
-    Creates an instance of the torch_model and fits the given data on it.
-    This trains the given configuration on the train set and also gives the validation error
-    that might be used for early stopping. Finally the test accuracy of the final model is put out.
+    Used to evaluate the final incumbent of the smac evaluation
 
     :param cfg: Configuration (basically a dictionary)
         configuration chosen by smac
     :param seed: int or RandomState
         used to initialize the rf's random generator
-    :param budget: float
-        used to set max iterations for the MLP
+
     Returns
     -------
     test accuracy on test set
