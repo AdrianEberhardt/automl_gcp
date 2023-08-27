@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Mapping, Optional
 from functools import partial
@@ -24,6 +26,7 @@ from ConfigSpace import (
 )
 from ConfigSpace.read_and_write import json as cs_json
 from ConfigSpace.read_and_write import pcs_new, pcs
+from scipy.stats import spearmanr
 
 from sklearn.model_selection import StratifiedKFold
 from smac.facade.multi_fidelity_facade import MultiFidelityFacade as SMAC4MF
@@ -40,6 +43,7 @@ from datasets import load_deep_woods, load_fashion_mnist
 logger = logging.getLogger(__name__)
 
 CV_SPLIT_SEED = 42
+
 
 def configuration_space(
         device: str,
@@ -90,7 +94,7 @@ def configuration_space(
 
         # Add multiple conditions on hyperparameters at once:
         cs.add_conditions([use_conv_layer_2, use_conv_layer_1, use_fc_layer_2, use_fc_layer_1])
-    
+
     else:
         with open(cs_file, "r") as fh:
             cs_string = fh.read()
@@ -113,6 +117,7 @@ def configuration_space(
         logging.debug(f"Configuration space:\n{cs}")
 
     return cs
+
 
 def get_optimizer_and_criterion(
         cfg: Mapping[str, Any]
@@ -240,6 +245,118 @@ def cnn_from_cfg(
     results = val_error
     return results
 
+
+def cnn_from_cfg_mf(
+        cfg: Configuration,
+        seed: int,
+        fidelity: str,
+        budget: float,
+) -> float:
+    """
+    Creates an instance of the torch_model and fits the given data on it.
+    This is the function-call we try to optimize. Chosen values are stored in
+    the configuration (cfg).
+
+    :param cfg: Configuration (basically a dictionary)
+        configuration chosen by smac
+    :param seed: int or RandomState
+        used to initialize the rf's random generator
+    :param budget: float
+        used to set max iterations for the MLP
+    Returns
+    -------
+    val_accuracy cross validation accuracy
+    """
+    try:
+        worker_id = get_worker().name
+    except ValueError:
+        worker_id = 0
+
+    # If data already existing on disk, set to False
+    download = False
+
+    lr = cfg["learning_rate_init"]
+    dataset = cfg["dataset"]
+    device = cfg["device"]
+    batch_size = cfg["batch_size"]
+    ds_path = cfg["datasetpath"]
+
+    # determine fidelity and used budget
+    img_size = int(np.floor(budget)) if fidelity == "img_size" else 16
+    epochs = int(np.floor(budget)) if fidelity == "epochs" else 10
+
+    # Device configuration
+    torch.manual_seed(seed)
+    model_device = torch.device(device)
+
+    if "fashion_mnist" in dataset:
+        input_shape, train_val, _ = load_fashion_mnist(datadir=Path(ds_path, "FashionMNIST"))
+    elif "deepweedsx" in dataset:
+        input_shape, train_val, _ = load_deep_woods(
+            datadir=Path(ds_path, "deepweedsx"),
+            resize=(img_size, img_size),
+            balanced="balanced" in dataset,
+            download=download,
+        )
+    else:
+        raise NotImplementedError
+
+    # returns the cross-validation accuracy
+    # to make CV splits consistent
+    cv = StratifiedKFold(n_splits=3, random_state=CV_SPLIT_SEED, shuffle=True)
+
+    score = []
+    cv_splits = cv.split(train_val, train_val.targets)
+    for cv_index, (train_idx, valid_idx) in enumerate(cv_splits, start=1):
+        logging.info(f"Worker:{worker_id} ------------ CV {cv_index} -----------")
+        train_data = Subset(train_val, list(train_idx))
+        val_data = Subset(train_val, list(valid_idx))
+
+        train_loader = DataLoader(
+            dataset=train_data,
+            batch_size=batch_size,
+            shuffle=True,
+        )
+        val_loader = DataLoader(
+            dataset=val_data,
+            batch_size=batch_size,
+            shuffle=False,
+        )
+
+        model = Model(
+            config=cfg,
+            input_shape=input_shape,
+            num_classes=len(train_val.classes),
+        )
+        model = model.to(model_device)
+
+        # summary(model, input_shape, device=device)
+
+        model_optimizer, train_criterion = get_optimizer_and_criterion(cfg)
+        optimizer = model_optimizer(model.parameters(), lr=lr)
+        train_criterion = train_criterion().to(device)
+
+        for epoch in range(epochs):  # 20 epochs
+            logging.info(f"Worker:{worker_id} " + "#" * 50)
+            logging.info(f"Worker:{worker_id} Epoch [{epoch + 1}/{epochs}]")
+            train_score, train_loss = model.train_fn(
+                optimizer=optimizer,
+                criterion=train_criterion,
+                loader=train_loader,
+                device=model_device
+            )
+            # logging.info(f"Worker:{worker_id} => Train accuracy {train_score:.3f} | loss {train_loss}")
+
+        val_score = model.eval_fn(val_loader, device)
+        logging.info(f"Worker:{worker_id} => Val accuracy {val_score:.3f}")
+        score.append(val_score)
+
+    val_error = 1 - np.mean(score)  # because minimize
+
+    results = val_error
+    return results
+
+
 def optimize_smac_hyperparameters(trial):
     # Optimize parameters of the random forest model
     n_trees = trial.suggest_int("n_trees", 10, 25)
@@ -254,11 +371,13 @@ def optimize_smac_hyperparameters(trial):
         "min_samples_leaf": min_samples_leaf,
     }
 
+
 def plot_main_trajectory(facades: list[AbstractFacade], plot_name: str = 'epoch') -> None:
     """Plots the trajectory (incumbents) of the optimization process."""
     plt.figure()
     plt.title("Trajectory")
     plt.xlabel("Wallclock time [s]")
+    plt.ylabel(facades[0].scenario.objectives)
 
     for facade in facades:
         X, Y = [], []
@@ -279,11 +398,11 @@ def plot_main_trajectory(facades: list[AbstractFacade], plot_name: str = 'epoch'
     plt.show()
     plt.savefig(f"visualizations/trajectory_{plot_name}.png")
 
+
 def plot_optuna_trajectories(dictionary):
     plt.figure()
     plt.title("Trajectories")
     plt.xlabel("Wallclock time [s]")
-
 
     for trial_key, data in dictionary.items():
         trial_no = data['trial_no']
@@ -308,6 +427,128 @@ def plot_optuna_trajectories(dictionary):
     plt.legend()
     plt.show()
     plt.savefig(f"visualizations/trajectory_optuna.png")
+
+
+def plot_seeds_trajectory(results_per_seed: dict) -> None:
+    plt.figure()
+    plt.title("Trajectory")
+    plt.xlabel("Wallclock time [s]")
+    plt.ylabel(next(iter(results_per_seed.values())).scenario.objectives)  # cost
+    plt.ylim(0.3, 0.8)
+
+    for (seed, budget_type), facade in results_per_seed.items():
+        logging.info(f"facades {seed} and budget type {budget_type}")
+        X, Y = [], []
+        for item in facade.intensifier.trajectory:
+            # Single-objective optimization
+            assert len(item.config_ids) == 1
+            assert len(item.costs) == 1
+
+            y = item.costs[0]
+            x = item.walltime
+
+            X.append(x)
+            Y.append(y)
+
+        plt.plot(X, Y, label=f"{budget_type} - Seed {seed}")  # Include seed in label
+        plt.scatter(X, Y, marker="x")
+
+    plt.legend()
+    plt.savefig('visualizations/trajectory_seeds.png')
+
+
+def train_mf_selection(cs: ConfigurationSpace) -> str:
+    results_per_seed = {}
+    fidelity_budgets = {'img_size': (8, 16), 'epochs': (5, 10)} # use reduced budgets to decrease processing time
+
+    for seed in range(2):
+        for fidelity, budgets in fidelity_budgets.items():
+            logging.info(f"Budget type: {fidelity} - Seed: {seed}")
+
+            scenario = Scenario(
+                configspace=cs,
+                walltime_limit=360,
+                n_trials=100,
+                deterministic=True,
+                output_directory=Path("./tmp"),
+                min_budget=budgets[0],
+                max_budget=budgets[1],
+                n_workers=10,
+                seed=seed,  # Use a different seed for each run
+                name=f"MFO({fidelity}_Seed{seed})"
+            )
+
+            smac = SMAC4MF(
+                target_function=partial(cnn_from_cfg_mf, fidelity=fidelity),
+                scenario=scenario,
+                initial_design=SMAC4MF.get_initial_design(scenario=scenario, n_configs=2),
+                intensifier=Hyperband(
+                    scenario=scenario,
+                    incumbent_selection="highest_budget",
+                    eta=2,
+                ),
+                overwrite=True,
+                logging_level=20  # https://automl.github.io/SMAC3/main/advanced_usage/8_logging.html
+            )
+
+            smac.optimize()
+            results_per_seed[(seed, fidelity)] = smac
+
+    plot_seeds_trajectory(results_per_seed)
+    best_fidelity = get_best_fidelity(results_per_seed)
+    return best_fidelity
+
+
+def get_best_fidelity(results_per_seed: dict) -> str:
+    seperate_run_scores = {}
+    for (seed, budget_type), facade in results_per_seed.items():
+        X, Y = [], []
+        for item in facade.intensifier.trajectory:
+            # Single-objective optimization
+            assert len(item.config_ids) == 1
+            assert len(item.costs) == 1
+
+            y = item.costs[0]
+            x = item.walltime
+
+            X.append(x)
+            Y.append(y)
+        seperate_run_scores[(seed, budget_type)] = (
+        np.mean(X), np.mean(Y))  # calc the mean walltime and mean cost for each seed and budget
+    logging.info(seperate_run_scores)
+
+    # avg results per seed
+    # Initialize a defaultdict to store scores per seed and hyperparameter
+    scores_per_seed_fidelity = defaultdict(list)
+
+    # Iterate through the input dictionary and group scores by seed and hyperparameter
+    for (seed, fidelity), (mean_x, mean_y) in seperate_run_scores.items():
+        scores_per_seed_fidelity[fidelity].append((mean_x, mean_y))
+
+    avg_dist_per_fidelity = {}
+
+    # avg the results of the seeds per fidelity and calc the distance of the mean scores per fidelity to the origin
+    for fidelity, tuples_list in scores_per_seed_fidelity.items():
+        avg_x = np.mean([t[0] for t in tuples_list])
+        avg_y = np.mean([t[1] for t in tuples_list])
+        avg_dist_per_fidelity[fidelity] = math.sqrt(avg_x ** 2 + avg_y ** 2)
+
+    min_distance_fidelity = min(avg_dist_per_fidelity, key=avg_dist_per_fidelity.get)
+    return min_distance_fidelity
+
+
+def calc_spearman_correlation(confs: list[Configuration], seed: int, fidelity_budgets: dict) -> float:
+    sp_correlations = dict()
+
+    for fidelity, budgets in fidelity_budgets.items():
+        print(f"fidelity: {fidelity}: eval confs with {budgets[0]} budget")
+        eval_cheaps = [cnn_from_cfg(conf, seed, fidelity, budgets[0]) for conf in confs]
+        print(f"fidelity: {fidelity}: eval confs with {budgets[1]} budget ")
+        eval_exp = [cnn_from_cfg(conf, seed, fidelity, budgets[1]) for conf in confs]
+        sp_correlations.update({fidelity: spearmanr(eval_cheaps, eval_exp)})
+
+    return sp_correlations
+
 
 def final_training(
         cfg: Configuration,
@@ -436,7 +677,6 @@ if __name__ == "__main__":
     #                                           Setting up the arguments                                            #
     #################################################################################################################
 
-
     parser = argparse.ArgumentParser(description="MF example using BOHB.")
     parser.add_argument(
         "--dataset",
@@ -463,7 +703,7 @@ if __name__ == "__main__":
         help="maximal budget (epochs) to use with BOHB",
     )
     parser.add_argument(
-        "--min_budget", type=float, default=3, help="Minimum budget (epochs) for BOHB"
+        "--min_budget", type=float, default=5, help="Minimum budget (epochs) for BOHB"
     )
     parser.add_argument("--eta", type=int, default=2, help="eta for BOHB")
     parser.add_argument("--seed", type=int, default=0, help="random seed")
@@ -502,6 +742,18 @@ if __name__ == "__main__":
                         help='Path to file containing the configuration space')
     parser.add_argument('--datasetpath', type=Path, default=Path('./data/'),
                         help='Path to directory containing the dataset')
+
+    parser.add_argument(
+        "--mf_selection",
+        choices=[
+            "TRAJECTORY_DIST",
+            "SPR_CORRELATION"
+        ],
+        default="TRAJECTORY_DIST",  # spearman rank requires sufficient amount of configs
+        # for evaluation to be statistically signifcant which can be computationally expensive
+        help="choice of the method to determine the best fidelity",
+    )
+
     args = parser.parse_args()
     
     logging.basicConfig(level=args.log_level)
@@ -521,8 +773,30 @@ if __name__ == "__main__":
     #                                 Plot Multi-fidelity plot                                                      #
     #################################################################################################################
 
+    minimal_configspace = configuration_space(
+        device=args.device,
+        dataset=args.dataset,
+        cv_count=args.cv_count,
+        datasetpath=args.datasetpath,
+        cs_file=Path("minimal_configspace.json")
+    )
 
+    start_time = time.time()
 
+    if args.mf_selection == "SPR_CORRELATION":
+        sample_configs = minimal_configspace.sample_configuration(20)
+        fidelity_budgets = {'img_size': (8, 16), 'epochs': (5, 20)}
+        sp_rank_corr = calc_spearman_correlation(sample_configs, args.seed, fidelity_budgets)
+        significant_sp_corr = {k: v for k, v in sp_rank_corr.items() if v.pvalue < 0.05}
+        sorted_sp_corr = dict(sorted(significant_sp_corr.items(), key=lambda item: item[1].statistic))
+        best_fidelity = list(sorted_sp_corr.items())[1]  # yields the fidelity with the highest spearman rank correlation
+        logging.info(f"The best fidelity based on the spearman rank correlation is the fidelity {best_fidelity[0]}"
+                     f" with a spr of {best_fidelity[1]}")
+    else:
+        best_fidelity = train_mf_selection(minimal_configspace)
+        logging.info(f"The best fidelity due to the trajectory on reduced parameters is the fidelity {best_fidelity}")
+
+    print("--- Multi-fidelity selection took: %s seconds ---" % (time.time() - start_time))
 
     #################################################################################################################
     #                                 OPTUNA optimization process and visualizations                                #
