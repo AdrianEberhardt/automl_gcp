@@ -536,9 +536,15 @@ def calc_spearman_correlation(confs: list[Configuration], seed: int, fidelity_bu
 
     for fidelity, budgets in fidelity_budgets.items():
         print(f"fidelity: {fidelity}: eval confs with {budgets[0]} budget")
+        start = time.time()
         eval_cheaps = [cnn_from_cfg_mf(conf, seed, fidelity, budgets[0]) for conf in confs]
+        end = time.time()
+        logging.info("time for 10 cheap evals (img_size 8/epochs 5) for minimal configspace", end - start)
         print(f"fidelity: {fidelity}: eval confs with {budgets[1]} budget ")
+        start = time.time()
         eval_exp = [cnn_from_cfg_mf(conf, seed, fidelity, budgets[1]) for conf in confs]
+        end = time.time()
+        logging.info("time for 10 medium exp evals (img_size 16/epochs 10) for minimal configspace", end - start)
         sp_correlations.update({fidelity: spearmanr(eval_cheaps, eval_exp)})
 
     return sp_correlations
